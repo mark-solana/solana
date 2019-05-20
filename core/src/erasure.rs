@@ -40,7 +40,7 @@
 //!             |<============== data blob part for "coding"  ==============>|
 //!
 //!
-use crate::packet::{Blob, SharedBlob, BLOB_DATA_SIZE, BLOB_HEADER_SIZE};
+use crate::packet::{Blob, SharedBlob, BLOB_HEADER_SIZE};
 use std::cmp;
 use std::convert::AsMut;
 use std::sync::{Arc, RwLock};
@@ -60,143 +60,26 @@ type Result<T> = std::result::Result<T, reed_solomon_erasure::Error>;
 /// Represents an erasure "session" with a particular configuration and number of data and coding
 /// blobs
 #[derive(Debug, Clone)]
-pub struct Session {
-    rse: Arc<ReedSolomon>,
-}
-
-/// Represents an erasure "session" with a particular configuration and number of data and coding
-/// blobs
-#[derive(Debug, Clone)]
-pub struct Codec {
-    rse: Arc<ReedSolomon>,
-}
-
-impl Codec {
-    pub fn new(data_count: usize, coding_count: usize) -> Result<Self> {
-        let rse = ReedSolomon::new(data_count, coding_count)?;
-
-        Ok(Codec { rse: Arc::new(rse) })
-    }
-
-    /// Create coding blocks by overwriting `parity`
-    pub fn encode(&self, data: &[&[u8]], parity: &mut [&mut [u8]]) -> Result<()> {
-        self.rse.encode_sep(data, parity)?;
-
-        Ok(())
-    }
-
-    /// Recover data + coding blocks into data blocks
-    /// # Arguments
-    /// * `data` - array of data blocks to recover into
-    /// * `coding` - array of coding blocks
-    /// * `erasures` - list of indices in data where blocks should be recovered
-    pub fn decode_blocks(&self, blocks: &mut [&mut [u8]], present: &[bool]) -> Result<()> {
-        self.rse.reconstruct(blocks, present)?;
-
-        Ok(())
-    }
-
-    /// Returns `(number_of_data_blobs, number_of_coding_blobs)`
-    pub fn dimensions(&self) -> (usize, usize) {
-        (self.rse.data_shard_count(), self.rse.parity_shard_count())
-    }
-
-    pub fn set_dimension(&mut self, data_count: usize, coding_count: usize) -> Result<()> {
-        let rse = ReedSolomon::new(data_count, coding_count)?;
-        self.rse = Arc::new(rse);
-
-        Ok(())
-    }
-
-    /// Reconstruct any missing blobs in this erasure set if possible
-    /// Re-indexes any coding blobs that have been reconstructed and fixes up size in metadata
-    /// Assumes that the user has sliced into the blobs appropriately already. else recovery will
-    /// return an error or garbage data
-    pub fn reconstruct_blobs<B>(
-        &self,
-        blobs: &mut [B],
-        present: &[bool],
-        size: usize,
-        block_start_idx: u64,
-        slot: u64,
-    ) -> Result<(Vec<Blob>, Vec<Blob>)>
-    where
-        B: AsMut<[u8]>,
-    {
-        let mut blocks: Vec<&mut [u8]> = blobs.iter_mut().map(AsMut::as_mut).collect();
-
-        trace!("[reconstruct_blobs] present: {:?}, size: {}", present, size,);
-
-        // Decode the blocks
-        self.decode_blocks(blocks.as_mut_slice(), &present)?;
-
-        let mut recovered_data = vec![];
-        let mut recovered_coding = vec![];
-
-        let erasures = present
-            .iter()
-            .enumerate()
-            .filter_map(|(i, present)| if *present { None } else { Some(i) });
-
-        // Create the missing blobs from the reconstructed data
-        for n in erasures {
-            let data_size;
-            let idx;
-            let first_byte;
-
-            if n < NUM_DATA {
-                let mut blob = Blob::new(&blocks[n]);
-
-                data_size = blob.data_size() as usize - BLOB_HEADER_SIZE;
-                idx = n as u64 + block_start_idx;
-                first_byte = blob.data[0];
-
-                blob.set_size(data_size);
-                recovered_data.push(blob);
-            } else {
-                let mut blob = Blob::default();
-                blob.data_mut()[..size].copy_from_slice(&blocks[n]);
-                data_size = size;
-                idx = (n as u64 + block_start_idx) - NUM_DATA as u64;
-                first_byte = blob.data[0];
-
-                blob.set_slot(slot);
-                blob.set_index(idx);
-                blob.set_size(data_size);
-                recovered_coding.push(blob);
-            }
-
-            trace!(
-                "[reconstruct_blobs] erasures[{}] ({}) data_size: {} data[0]: {}",
-                n,
-                idx,
-                data_size,
-                first_byte
-            );
-        }
-
-        Ok((recovered_data, recovered_coding))
-    }
-}
+pub struct Session(ReedSolomon);
 
 /// Generates coding blobs on demand given data blobs
 #[derive(Debug, Clone)]
 pub struct CodingGenerator {
     /// SharedBlobs that couldn't be used in last call to next()
     leftover: Vec<SharedBlob>,
-    session: Session,
+    session: Arc<Session>,
 }
 
 impl Session {
     pub fn new(data_count: usize, coding_count: usize) -> Result<Session> {
-        let rse = ReedSolomon::new(data_count, coding_count)?;
+        let rs = ReedSolomon::new(data_count, coding_count)?;
 
-        Ok(Session { rse: Arc::new(rse) })
+        Ok(Session(rs))
     }
 
     /// Create coding blocks by overwriting `parity`
     pub fn encode(&self, data: &[&[u8]], parity: &mut [&mut [u8]]) -> Result<()> {
-        self.rse.encode_sep(data, parity)?;
+        self.0.encode_sep(data, parity)?;
 
         Ok(())
     }
@@ -207,14 +90,14 @@ impl Session {
     /// * `coding` - array of coding blocks
     /// * `erasures` - list of indices in data where blocks should be recovered
     pub fn decode_blocks(&self, blocks: &mut [&mut [u8]], present: &[bool]) -> Result<()> {
-        self.rse.reconstruct(blocks, present)?;
+        self.0.reconstruct(blocks, present)?;
 
         Ok(())
     }
 
     /// Returns `(number_of_data_blobs, number_of_coding_blobs)`
     pub fn dimensions(&self) -> (usize, usize) {
-        (self.rse.data_shard_count(), self.rse.parity_shard_count())
+        (self.0.data_shard_count(), self.0.parity_shard_count())
     }
 
     /// Reconstruct any missing blobs in this erasure set if possible
@@ -286,21 +169,12 @@ impl Session {
 
         Ok((recovered_data, recovered_coding))
     }
-
-    fn generator(&self) -> Generator {
-        Generator {
-            coding: vec![Blob::default(); self.rse.parity_shard_count()],
-            data_idx: 0,
-            rse: self.rse.clone(),
-            current_slot: None,
-        }
-    }
 }
 
 impl CodingGenerator {
-    pub fn new(session: Session) -> Self {
+    pub fn new(session: Arc<Session>) -> Self {
         CodingGenerator {
-            leftover: Vec::with_capacity(session.rse.data_shard_count()),
+            leftover: Vec::with_capacity(session.0.data_shard_count()),
             session,
         }
     }
@@ -386,91 +260,6 @@ impl CodingGenerator {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Generator {
-    rse: Arc<ReedSolomon>,
-    data_idx: usize,
-    coding: Vec<Blob>,
-    current_slot: Option<u64>,
-}
-
-impl Generator {
-    /// Yields next set of coding blobs, if any.
-    /// Must be called with consecutive data blobs within a slot.
-    ///
-    /// Passing in a slice with the first blob having a new slot will cause internal state to
-    /// reset, so the above concern does not apply to slot boundaries, only indexes within a slot
-    /// must be consecutive.
-    ///
-    /// If used improperly, it my return garbage coding blobs, but will not give an
-    /// error.
-    pub fn next(&mut self, next_data: &[SharedBlob]) -> Vec<SharedBlob> {
-        let mut ready_coding = vec![];
-        let num_data = self.rse.data_shard_count();
-        let num_coding = self.rse.parity_shard_count();
-
-        let mut refresh = |this: &mut Generator| {
-            ready_coding.extend(
-                this.coding
-                    .drain(..)
-                    .map(|blob| Arc::new(RwLock::new(blob))),
-            );
-            this.coding.resize_with(num_coding, || Blob::default());
-            this.data_idx = 0;
-        };
-
-        if self.data_idx == num_data {
-            refresh(self);
-        }
-
-        for data_blob in next_data {
-            let data_blob = data_blob.read().unwrap();
-
-            match self.current_slot {
-                None => self.current_slot = Some(data_blob.slot()),
-                _ => {}
-            }
-
-            if self.current_slot.unwrap() != data_blob.slot() {
-                self.current_slot = Some(data_blob.slot());
-                refresh(self);
-            }
-
-            let mut coding_ptrs = self
-                .coding
-                .iter_mut()
-                .map(|blob| &mut blob.data[BLOB_HEADER_SIZE..])
-                .collect::<Vec<_>>();
-
-            if let Ok(_) = self.rse.encode_single_sep(
-                self.data_idx,
-                &data_blob.data[..BLOB_HEADER_SIZE + BLOB_DATA_SIZE],
-                &mut coding_ptrs,
-            ) {
-                self.data_idx += 1;
-            }
-
-            if self.data_idx == num_data {
-                refresh(self);
-            }
-        }
-
-        ready_coding
-    }
-
-    /// Returns `(number_of_data_blobs, number_of_coding_blobs)`
-    pub fn dimensions(&self) -> (usize, usize) {
-        (self.rse.data_shard_count(), self.rse.parity_shard_count())
-    }
-
-    pub fn set_dimension(&mut self, data_count: usize, coding_count: usize) -> Result<()> {
-        let rse = ReedSolomon::new(data_count, coding_count)?;
-        self.rse = Arc::new(rse);
-
-        Ok(())
-    }
-}
-
 impl Default for Session {
     fn default() -> Session {
         Session::new(NUM_DATA, NUM_CODING).unwrap()
@@ -481,8 +270,8 @@ impl Default for CodingGenerator {
     fn default() -> Self {
         let session = Session::default();
         CodingGenerator {
-            leftover: Vec::with_capacity(session.rse.data_shard_count()),
-            session,
+            leftover: Vec::with_capacity(session.0.data_shard_count()),
+            session: Arc::new(session),
         }
     }
 }
