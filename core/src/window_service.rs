@@ -4,7 +4,7 @@
 use crate::blocktree::Blocktree;
 use crate::cluster_info::ClusterInfo;
 use crate::leader_schedule_cache::LeaderScheduleCache;
-use crate::packet::{Blob, SharedBlob, BLOB_HEADER_SIZE};
+use crate::packet::{Blob, SharedBlob};
 use crate::repair_service::{RepairService, RepairStrategy};
 use crate::result::{Error, Result};
 use crate::service::Service;
@@ -64,11 +64,7 @@ fn process_blobs(blobs: &[SharedBlob], blocktree: &Arc<Blocktree>) -> Result<()>
 
         // Insert the new blob into block tree
         if blob.is_coding() {
-            blocktree.put_coding_blob_bytes(
-                blob.slot(),
-                blob.index(),
-                &blob.data[..BLOB_HEADER_SIZE + blob.size()],
-            )?;
+            blocktree.put_coding_blob(&blob)?;
         }
     }
     Ok(())

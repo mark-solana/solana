@@ -3,7 +3,7 @@
 use crate::blocktree::Blocktree;
 use crate::cluster_info::{ClusterInfo, ClusterInfoError, DATA_PLANE_FANOUT};
 use crate::entry::EntrySlice;
-use crate::erasure::CodingGenerator;
+use crate::erasure;
 use crate::packet::index_blobs_with_genesis;
 use crate::poh_recorder::WorkingBankEntries;
 use crate::result::{Error, Result};
@@ -28,7 +28,7 @@ pub enum BroadcastStageReturnType {
 
 struct Broadcast {
     id: Pubkey,
-    coding_generator: CodingGenerator,
+    set_index: u64,
 }
 
 impl Broadcast {
@@ -113,11 +113,21 @@ impl Broadcast {
 
         if contains_last_tick {
             blobs.last().unwrap().write().unwrap().set_is_last_in_slot();
+            self.set_index = 0;
+        }
+
+        let mut coding = vec![];
+        let mut six = blob_index;
+        for set in blobs.chunks(erasure::MAX_SET_SIZE) {
+            // TODO: decide the number of parity blobs intelligently
+            let mut coding_set =
+                erasure::encode_shared(bank.slot(), self.set_index, six, set, set.len())?;
+            coding.append(&mut coding_set);
+            self.set_index += 1;
+            six += set.len() as u64;
         }
 
         blocktree.write_shared_blobs(&blobs)?;
-
-        let coding = self.coding_generator.next(&blobs);
 
         let to_blobs_elapsed = duration_as_ms(&to_blobs_start.elapsed());
 
@@ -180,11 +190,10 @@ impl BroadcastStage {
         genesis_blockhash: &Hash,
     ) -> BroadcastStageReturnType {
         let me = cluster_info.read().unwrap().my_data().clone();
-        let coding_generator = CodingGenerator::default();
 
         let mut broadcast = Broadcast {
             id: me.id,
-            coding_generator,
+            set_index: 0,
         };
 
         loop {
