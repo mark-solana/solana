@@ -38,6 +38,17 @@ pub struct Meta {
     pub v6: bool,
 }
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct CodingHeader {
+    pub encoded: bool,
+    pub start_index: u64,
+    pub set_index: Option<u64>,
+    pub data_count: usize,
+    pub parity_count: usize,
+    pub shard_size: usize,
+}
+
 #[derive(Clone)]
 #[repr(C)]
 pub struct Packet {
@@ -357,19 +368,14 @@ macro_rules! range {
 const PARENT_RANGE: std::ops::Range<usize> = range!(0, u64);
 const SLOT_RANGE: std::ops::Range<usize> = range!(PARENT_RANGE.end, u64);
 const INDEX_RANGE: std::ops::Range<usize> = range!(SLOT_RANGE.end, u64);
-const ID_RANGE: std::ops::Range<usize> = range!(INDEX_RANGE.end, Pubkey);
+const CODING_RANGE: std::ops::Range<usize> = range!(INDEX_RANGE.end, CodingHeader);
+const ID_RANGE: std::ops::Range<usize> = range!(CODING_RANGE.end, Pubkey);
 const FORWARDED_RANGE: std::ops::Range<usize> = range!(ID_RANGE.end, bool);
 const GENESIS_RANGE: std::ops::Range<usize> = range!(FORWARDED_RANGE.end, Hash);
 const FLAGS_RANGE: std::ops::Range<usize> = range!(GENESIS_RANGE.end, u32);
 const SIZE_RANGE: std::ops::Range<usize> = range!(FLAGS_RANGE.end, u64);
 
-macro_rules! align {
-    ($x:expr, $align:expr) => {
-        $x + ($align - 1) & !($align - 1)
-    };
-}
-
-pub const BLOB_HEADER_SIZE: usize = align!(SIZE_RANGE.end, BLOB_DATA_ALIGN); // make sure data() is safe for erasure
+pub const BLOB_HEADER_SIZE: usize = SIZE_RANGE.end; // make sure data() is safe for erasure
 
 pub const BLOB_FLAG_IS_LAST_IN_SLOT: u32 = 0x2;
 
@@ -417,6 +423,14 @@ impl Blob {
     }
     pub fn set_index(&mut self, ix: u64) {
         LittleEndian::write_u64(&mut self.data[INDEX_RANGE], ix);
+    }
+
+    pub fn set_coding_header(&mut self, header: &CodingHeader) {
+        bincode::serialize_into(&mut self.data[CODING_RANGE], header).unwrap();
+    }
+
+    pub fn get_coding_header(&self) -> CodingHeader {
+        bincode::deserialize(&self.data[CODING_RANGE]).unwrap()
     }
 
     /// sender id, we use this for identifying if its a blob from the leader that we should

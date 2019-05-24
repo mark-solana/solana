@@ -132,14 +132,21 @@ impl Backend for Rocks {
 
 impl Column<Rocks> for cf::Coding {
     const NAME: &'static str = super::ERASURE_CF;
-    type Index = (u64, u64);
+    type Index = (u64, u64, u64);
 
-    fn key(index: (u64, u64)) -> Vec<u8> {
-        cf::Data::key(index)
+    fn key((slot, set_index, index): (u64, u64, u64)) -> Vec<u8> {
+        let mut key = vec![0; 24];
+        BigEndian::write_u64(&mut key[..8], slot);
+        BigEndian::write_u64(&mut key[8..16], set_index);
+        BigEndian::write_u64(&mut key[16..], index);
+        key
     }
 
-    fn index(key: &[u8]) -> (u64, u64) {
-        cf::Data::index(key)
+    fn index(key: &[u8]) -> (u64, u64, u64) {
+        let slot = BigEndian::read_u64(&key[..8]);
+        let set_index = BigEndian::read_u64(&key[8..16]);
+        let index = BigEndian::read_u64(&key[16..]);
+        (slot, set_index, index)
     }
 }
 

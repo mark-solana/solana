@@ -1,4 +1,7 @@
-use crate::erasure::{NUM_CODING, NUM_DATA};
+use crate::{
+    erasure::{NUM_CODING, NUM_DATA},
+    packet::CodingHeader,
+};
 use solana_metrics::datapoint;
 use std::borrow::Borrow;
 
@@ -72,13 +75,11 @@ impl SlotMeta {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
 /// Erasure coding information
 pub struct ErasureMeta {
-    /// Which erasure set in the slot this is
-    pub set_index: u64,
-    /// Size of shards in this erasure set
-    pub size: usize,
+    /// Session information for recovery
+    header: CodingHeader,
     /// Bitfield representing presence/absence of data blobs
     data: u64,
     /// Bitfield representing presence/absence of coding blobs
@@ -90,28 +91,48 @@ pub enum ErasureMetaStatus {
     CanRecover,
     DataFull,
     StillNeed(usize),
+    Ambiguous,
 }
 
 impl ErasureMeta {
-    pub fn new(set_index: u64) -> ErasureMeta {
+    pub(in crate::blocktree) fn new() -> ErasureMeta {
+        ErasureMeta { ..Self::default() }
+    }
+
+    pub fn from_header(header: CodingHeader) -> Self {
         ErasureMeta {
-            set_index,
-            size: 0,
-            data: 0,
             coding: 0,
+            data: 0,
+            header,
         }
     }
 
+    pub fn session_info(&self) -> CodingHeader {
+        self.header
+    }
+
+    pub fn set_session_info(&mut self, header: CodingHeader) {
+        self.header = header;
+    }
+
     pub fn status(&self) -> ErasureMetaStatus {
-        let (data_missing, coding_missing) =
-            (NUM_DATA - self.num_data(), NUM_CODING - self.num_coding());
-        if data_missing > 0 && data_missing + coding_missing <= NUM_CODING {
-            assert!(self.size != 0);
+        if !self.header.encoded {
+            return ErasureMetaStatus::Ambiguous;
+        }
+        self.num_data();
+        self.header.data_count;
+        let (data_missing, coding_missing) = (
+            self.header.data_count - self.num_data(),
+            self.header.parity_count - self.num_coding(),
+        );
+
+        if data_missing > 0 && data_missing + coding_missing <= self.header.parity_count {
+            assert!(self.header.shard_size != 0);
             ErasureMetaStatus::CanRecover
         } else if data_missing == 0 {
             ErasureMetaStatus::DataFull
         } else {
-            ErasureMetaStatus::StillNeed(data_missing + coding_missing - NUM_CODING)
+            ErasureMetaStatus::StillNeed(data_missing + coding_missing - self.header.parity_count)
         }
     }
 
@@ -124,46 +145,38 @@ impl ErasureMeta {
     }
 
     pub fn is_coding_present(&self, index: u64) -> bool {
-        if let Some(position) = self.data_index_in_set(index) {
-            self.coding & (1 << position) != 0
-        } else {
-            false
-        }
+        self.coding & (1 << index) != 0
     }
 
     pub fn set_size(&mut self, size: usize) {
-        self.size = size;
+        self.header.shard_size = size;
     }
 
     pub fn size(&self) -> usize {
-        self.size
+        self.header.shard_size
     }
 
     pub fn set_coding_present(&mut self, index: u64, present: bool) {
-        if let Some(position) = self.data_index_in_set(index) {
-            if present {
-                self.coding |= 1 << position;
-            } else {
-                self.coding &= !(1 << position);
-            }
+        (index, present);
+        if present {
+            self.coding |= 1 << index;
+        } else {
+            self.coding &= !(1 << index);
         }
     }
 
     pub fn is_data_present(&self, index: u64) -> bool {
-        if let Some(position) = self.data_index_in_set(index) {
-            self.data & (1 << position) != 0
-        } else {
-            false
-        }
+        let position = self.data_index_in_set(index);
+        self.data & (1 << position) != 0
     }
 
     pub fn set_data_present(&mut self, index: u64, present: bool) {
-        if let Some(position) = self.data_index_in_set(index) {
-            if present {
-                self.data |= 1 << position;
-            } else {
-                self.data &= !(1 << position);
-            }
+        let position = self.data_index_in_set(index);
+        (index, position);
+        if present {
+            self.data |= 1 << position;
+        } else {
+            self.data &= !(1 << position);
         }
     }
 
@@ -187,74 +200,30 @@ impl ErasureMeta {
         }
     }
 
-    pub fn set_index_for(index: u64) -> u64 {
-        index / NUM_DATA as u64
+    pub fn data_index_in_set(&self, index: u64) -> u64 {
+        index - self.header.start_index
     }
 
-    pub fn data_index_in_set(&self, index: u64) -> Option<u64> {
-        let set_index = Self::set_index_for(index);
-
-        if set_index == self.set_index {
-            Some(index - self.start_index())
-        } else {
-            None
-        }
+    pub fn coding_index_in_set(&self, index: u64) -> u64 {
+        index + self.header.data_count as u64
     }
 
-    pub fn coding_index_in_set(&self, index: u64) -> Option<u64> {
-        self.data_index_in_set(index).map(|i| i + NUM_DATA as u64)
+    pub fn set_index(&self) -> Option<u64> {
+        self.header.set_index
     }
 
     pub fn start_index(&self) -> u64 {
-        self.set_index * NUM_DATA as u64
+        self.header.start_index
     }
 
     /// returns a tuple of (data_end, coding_end)
     pub fn end_indexes(&self) -> (u64, u64) {
-        let start = self.start_index();
-        (start + NUM_DATA as u64, start + NUM_CODING as u64)
+        let start = self.header.start_index;
+        (
+            start + self.header.data_count as u64,
+            self.header.parity_count as u64,
+        )
     }
-}
-
-#[test]
-fn test_meta_indexes() {
-    use rand::{thread_rng, Rng};
-    // to avoid casts everywhere
-    const NUM_DATA: u64 = crate::erasure::NUM_DATA as u64;
-
-    let mut rng = thread_rng();
-
-    for _ in 0..100 {
-        let set_index = rng.gen_range(0, 1_000);
-        let blob_index = (set_index * NUM_DATA) + rng.gen_range(0, NUM_DATA);
-
-        assert_eq!(set_index, ErasureMeta::set_index_for(blob_index));
-        let e_meta = ErasureMeta::new(set_index);
-
-        assert_eq!(e_meta.start_index(), set_index * NUM_DATA);
-        let (data_end_idx, coding_end_idx) = e_meta.end_indexes();
-        assert_eq!(data_end_idx, (set_index + 1) * NUM_DATA);
-        assert_eq!(coding_end_idx, set_index * NUM_DATA + NUM_CODING as u64);
-    }
-
-    let mut e_meta = ErasureMeta::new(0);
-
-    assert_eq!(e_meta.data_index_in_set(0), Some(0));
-    assert_eq!(e_meta.data_index_in_set(NUM_DATA / 2), Some(NUM_DATA / 2));
-    assert_eq!(e_meta.data_index_in_set(NUM_DATA - 1), Some(NUM_DATA - 1));
-    assert_eq!(e_meta.data_index_in_set(NUM_DATA), None);
-    assert_eq!(e_meta.data_index_in_set(std::u64::MAX), None);
-
-    e_meta.set_index = 1;
-
-    assert_eq!(e_meta.data_index_in_set(0), None);
-    assert_eq!(e_meta.data_index_in_set(NUM_DATA - 1), None);
-    assert_eq!(e_meta.data_index_in_set(NUM_DATA), Some(0));
-    assert_eq!(
-        e_meta.data_index_in_set(NUM_DATA * 2 - 1),
-        Some(NUM_DATA - 1)
-    );
-    assert_eq!(e_meta.data_index_in_set(std::u64::MAX), None);
 }
 
 #[test]
@@ -269,8 +238,8 @@ fn test_meta_coding_present() {
         assert_eq!(e_meta.is_coding_present(i), false);
     }
 
-    e_meta.set_index = ErasureMeta::set_index_for((NUM_DATA * 17) as u64);
-    let start_idx = e_meta.start_index();
+    e_meta.header.set_index = Some(17);
+    let start_idx = e_meta.header.start_index;
     e_meta.set_coding_multi(start_idx..start_idx + NUM_CODING as u64, true);
 
     for i in start_idx..start_idx + NUM_CODING as u64 {
@@ -300,7 +269,7 @@ fn test_erasure_meta_status() {
 
     assert_eq!(e_meta.status(), ErasureMetaStatus::DataFull);
 
-    e_meta.size = 1;
+    e_meta.header.shard_size = 1;
     e_meta.set_coding_multi(0..N_CODING, true);
 
     assert_eq!(e_meta.status(), ErasureMetaStatus::DataFull);
@@ -332,7 +301,7 @@ fn test_meta_data_present() {
         assert_eq!(e_meta.is_data_present(i), false);
     }
 
-    e_meta.set_index = ErasureMeta::set_index_for((NUM_DATA * 23) as u64);
+    e_meta.header.set_index = Some(23);
     let start_idx = e_meta.start_index();
     e_meta.set_data_multi(start_idx..start_idx + NUM_DATA as u64, true);
 
