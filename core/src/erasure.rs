@@ -40,7 +40,7 @@
 //!             |<============== data blob part for "coding"  ==============>|
 //!
 //!
-use crate::packet::{Blob, CodingHeader, SharedBlob, BLOB_HEADER_SIZE};
+use crate::packet::{Blob, SharedBlob, BLOB_HEADER_SIZE};
 use std::{
     borrow::BorrowMut,
     sync::{Arc, RwLock},
@@ -60,6 +60,31 @@ pub const MAX_SET_SIZE: usize = 255;
 
 type Result<T> = std::result::Result<T, reed_solomon_erasure::Error>;
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CodingHeader {
+    pub start_index: u64,
+    pub set_index: u64,
+    pub data_count: usize,
+    pub parity_count: usize,
+    pub shard_size: usize,
+}
+
+impl CodingHeader {
+    pub fn data_index_in_set(&self, index: u64) -> u64 {
+        index - self.start_index
+    }
+
+    pub fn coding_index_in_set(&self, index: u64) -> u64 {
+        index + self.data_count as u64
+    }
+
+    /// returns a tuple of (data_end, coding_end)
+    pub fn end_indexes(&self) -> (u64, u64) {
+        let start = self.start_index;
+        (start + self.data_count as u64, self.parity_count as u64)
+    }
+}
+
 pub fn encode<B: BorrowMut<Blob>>(
     slot: u64,
     set_index: u64,
@@ -74,9 +99,8 @@ pub fn encode<B: BorrowMut<Blob>>(
         data_count: data,
         parity_count: parity,
         start_index,
-        set_index: Some(set_index),
+        set_index: set_index,
         shard_size: 0,
-        encoded: true,
     };
 
     let shard_size = blobs
@@ -85,16 +109,15 @@ pub fn encode<B: BorrowMut<Blob>>(
         .max()
         .expect("must be >=1 blobs");
 
-    header.shard_size = crate::packet::BLOB_DATA_SIZE;
+    //header.shard_size = crate::packet::BLOB_DATA_SIZE;
+    header.shard_size = shard_size;
 
     let slices = blobs
         .iter_mut()
         .map(|b| {
             let blob: &mut Blob = b.borrow_mut();
             blob.set_coding_header(&header);
-            let ret = &blob.data[..shard_size];
-            dbg!(ret.len());
-            ret
+            &blob.data[..shard_size]
         })
         .collect::<Vec<_>>();
 
@@ -111,13 +134,16 @@ pub fn encode<B: BorrowMut<Blob>>(
         .enumerate()
         .map(|(idx, block)| {
             let mut blob = Blob::default();
-            blob.data_mut()[..shard_size].copy_from_slice(&block);
+            (&mut blob.data[BLOB_HEADER_SIZE..BLOB_HEADER_SIZE + shard_size])
+                .copy_from_slice(&block);
             blob.set_slot(slot);
-            blob.set_size(shard_size);
-            blob.set_coding_header(&header);
+            blob.set_size(shard_size - BLOB_HEADER_SIZE);
+            //blob.set_data_size(shard_size as u64);
             blob.set_coding();
+            blob.set_coding_header(&header);
             blob.set_index(idx as u64);
-            dbg!(blob)
+
+            blob
         })
         .collect();
 
@@ -146,19 +172,15 @@ pub fn encode_shared(
     Ok(parity_blobs)
 }
 
-pub fn decode<B>(blobs: &mut [B], present: &[bool]) -> Result<(Vec<Blob>, Vec<Blob>)>
+pub fn decode<B>(
+    info: &CodingHeader,
+    slot: u64,
+    blobs: &mut [B],
+    present: &[bool],
+) -> Result<(Vec<Blob>, Vec<Blob>)>
 where
     B: BorrowMut<Blob>,
 {
-    if blobs.is_empty() {
-        return Err(reed_solomon_erasure::Error::TooFewShards.into());
-    }
-
-    // call last to make sure it's a parity blob which is guaranteed to have
-    // the session info
-    let info = blobs.last().unwrap().borrow().get_coding_header();
-    let slot = blobs[0].borrow().slot();
-
     let rs = ReedSolomon::new(info.data_count as usize, info.parity_count as usize)?;
 
     let mut blocks = vec![];
@@ -167,10 +189,17 @@ where
         if idx < info.data_count {
             blocks.push(&mut blob.borrow_mut().data[..info.shard_size as usize]);
         } else {
-            blocks.push(&mut blob.borrow_mut().data_mut()[..info.shard_size as usize]);
+            blocks.push(
+                &mut blob.borrow_mut().data
+                    [BLOB_HEADER_SIZE..BLOB_HEADER_SIZE + info.shard_size as usize],
+            );
         }
     }
 
+    assert_eq!(
+        blocks.len(),
+        rs.data_shard_count() + rs.parity_shard_count()
+    );
     rs.reconstruct(&mut blocks[..], present)?;
 
     let mut recovered_data = vec![];
@@ -190,26 +219,34 @@ where
         let first_byte;
 
         if n < info.data_count {
-            let mut blob = Blob::new(&blocks[n]);
-            blob.data_mut()[..shard_size].copy_from_slice(&blocks[n]);
+            let mut blob: Box<Blob> = Box::default();
+            //blob.data_mut()[..shard_size].copy_from_slice(&blocks[n]);
+            (&mut blob.data[..shard_size]).copy_from_slice(&blocks[n]);
 
             data_size = blob.data_size() as usize - BLOB_HEADER_SIZE;
             idx = n as u64 + info.start_index;
             first_byte = blob.data[0];
 
+            blob.set_slot(slot);
+            blob.set_index(idx);
             blob.set_size(data_size);
-            recovered_data.push(blob);
+            blob.set_coding_header(info);
+
+            recovered_data.push(*blob);
         } else {
             let mut blob = Blob::default();
-            blob.data_mut()[..shard_size].copy_from_slice(&blocks[n]);
+            (&mut blob.data[BLOB_HEADER_SIZE..BLOB_HEADER_SIZE + shard_size])
+                .copy_from_slice(&blocks[n]);
+            //blob.data_mut()[..shard_size].copy_from_slice(&blocks[n]);
             data_size = shard_size;
-            idx = (n + shard_size - info.data_count) as u64;
+            idx = (n - info.parity_count) as u64;
             first_byte = blob.data[0];
 
             blob.set_slot(slot);
             blob.set_index(idx);
             blob.set_size(data_size);
-            recovered_coding.push(dbg!(blob));
+            blob.set_coding_header(info);
+            recovered_coding.push(blob);
         }
 
         trace!(
@@ -224,7 +261,12 @@ where
     Ok((recovered_data, recovered_coding))
 }
 
-pub fn decode_shared(blobs: &[SharedBlob], present: &[bool]) -> Result<(Vec<Blob>, Vec<Blob>)> {
+pub fn decode_shared(
+    info: &CodingHeader,
+    slot: u64,
+    blobs: &[SharedBlob],
+    present: &[bool],
+) -> Result<(Vec<Blob>, Vec<Blob>)> {
     let mut locks = blobs
         .iter()
         .map(|shared_blob| shared_blob.write().unwrap())
@@ -232,7 +274,7 @@ pub fn decode_shared(blobs: &[SharedBlob], present: &[bool]) -> Result<(Vec<Blob
 
     let mut blobs = locks.iter_mut().map(|lock| &mut **lock).collect::<Vec<_>>();
 
-    decode(&mut blobs[..], present)
+    decode(info, slot, &mut blobs[..], present)
 }
 
 #[cfg(test)]
@@ -280,27 +322,34 @@ pub mod test {
         pub data: Vec<SharedBlob>,
     }
 
-    fn test_toss_and_recover(data_blobs: &[SharedBlob], coding_blobs: &[SharedBlob]) {
+    fn test_toss_and_recover(slot: u64, data_blobs: &[SharedBlob], coding_blobs: &[SharedBlob]) {
         let mut blobs: Vec<SharedBlob> = Vec::with_capacity(ERASURE_SET_SIZE);
 
         blobs.push(SharedBlob::default()); // empty data, erasure at zero
-        for blob in &data_blobs[1..NUM_DATA] {
+        for blob in &data_blobs[1..] {
             // skip first blob
             blobs.push(blob.clone());
         }
 
         blobs.push(SharedBlob::default()); // empty coding, erasure at zero
-        for blob in &coding_blobs[1..NUM_CODING] {
+        for blob in &coding_blobs[1..] {
             blobs.push(blob.clone());
         }
+
+        let info = coding_blobs[0]
+            .read()
+            .unwrap()
+            .get_coding_header()
+            .expect("coding info");
 
         // toss one data and one coding
         let mut present = vec![true; blobs.len()];
         present[0] = false;
-        present[NUM_DATA] = false;
+        present[data_blobs.len()] = false;
 
         let (recovered_data, recovered_coding) =
-            decode_shared(&mut blobs[..], &present).expect("reconstruction must succeed");
+            decode_shared(&info, slot, &mut blobs[..], &present)
+                .expect("reconstruction must succeed");
 
         assert_eq!(recovered_data.len(), 1);
         assert_eq!(recovered_coding.len(), 1);
@@ -326,17 +375,27 @@ pub mod test {
 
     #[test]
     fn test_erasure_generate_coding() {
-        solana_logger::setup();
-
         // test coding by iterating one blob at a time
-        let data_blobs = generate_shared_test_blobs(0, NUM_DATA * 2);
-        let coding_blobs = encode_shared(0, 0, 0, &data_blobs[..], NUM_CODING).unwrap();
+        let test_blobs = generate_shared_test_blobs(0, NUM_DATA * 2);
 
-        test_toss_and_recover(&data_blobs, &coding_blobs);
+        for (idx, data_blobs) in test_blobs.chunks_exact(NUM_DATA).enumerate() {
+            let coding_blobs = encode_shared(
+                0,
+                idx as u64,
+                (idx * NUM_DATA) as u64,
+                &data_blobs[..],
+                NUM_CODING,
+            )
+            .unwrap();
+
+            test_toss_and_recover(0, &data_blobs, &coding_blobs);
+        }
     }
 
     #[test]
     fn test_erasure_generate_blocktree_with_coding() {
+        solana_logger::setup();
+
         let cases = vec![
             (NUM_DATA, NUM_CODING, 7, 5),
             (NUM_DATA - 6, NUM_CODING - 1, 5, 7),
@@ -366,19 +425,16 @@ pub mod test {
 
                 for erasure_spec in spec.set_specs.iter() {
                     let start_index = erasure_spec.set_index * NUM_DATA as u64;
-                    let (data_end, coding_end) = (
-                        start_index + erasure_spec.num_data as u64,
-                        start_index + erasure_spec.num_coding as u64,
-                    );
+                    let data_end = start_index + erasure_spec.num_data as u64;
 
                     for idx in start_index..data_end {
                         let opt_bytes = blocktree.get_data_blob_bytes(slot, idx).unwrap();
                         assert!(opt_bytes.is_some());
                     }
 
-                    for idx in start_index..coding_end {
+                    for idx in 0..erasure_spec.num_coding {
                         let opt_bytes = blocktree
-                            .get_coding_blob_bytes(slot, erasure_spec.set_index, idx)
+                            .get_coding_blob_bytes(slot, erasure_spec.set_index, idx as u64)
                             .unwrap();
                         assert!(opt_bytes.is_some());
                     }
@@ -415,6 +471,11 @@ pub mod test {
             for erasure_set in slot_model.chunks {
                 let erased_coding = erasure_set.coding[0].clone();
                 let erased_data = erasure_set.data[..3].to_vec();
+                let info = erasure_set.coding[0]
+                    .read()
+                    .unwrap()
+                    .get_coding_header()
+                    .expect("coding info");
 
                 let mut blobs = Vec::with_capacity(ERASURE_SET_SIZE);
 
@@ -436,7 +497,8 @@ pub mod test {
                 present[2] = false;
                 present[NUM_DATA] = false;
 
-                decode_shared(&mut blobs, &present).expect("reconstruction must succeed");
+                decode_shared(&info, slot_model.slot, &mut blobs, &present)
+                    .expect("reconstruction must succeed");
 
                 for (expected, recovered) in erased_data.iter().zip(blobs.iter()) {
                     let expected = expected.read().unwrap();
@@ -571,7 +633,7 @@ pub mod test {
             .into_iter()
             .map(|_| {
                 let mut blob = Blob::default();
-                blob.data_mut()[..data.len()].copy_from_slice(&data);
+                blob.data_mut().copy_from_slice(&data);
                 blob.set_size(data.len());
                 Arc::new(RwLock::new(blob))
             })

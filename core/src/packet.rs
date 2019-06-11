@@ -1,6 +1,9 @@
 //! The `packet` module defines data structures and methods to pull data from the network.
-use crate::recvmmsg::{recv_mmsg, NUM_RCVMMSGS};
-use crate::result::{Error, Result};
+use crate::{
+    erasure::CodingHeader,
+    recvmmsg::{recv_mmsg, NUM_RCVMMSGS},
+    result::{Error, Result},
+};
 use bincode;
 use byteorder::{ByteOrder, LittleEndian};
 use serde::Serialize;
@@ -36,17 +39,6 @@ pub struct Meta {
     pub addr: [u16; 8],
     pub port: u16,
     pub v6: bool,
-}
-
-#[derive(Clone, Copy, Default, Debug, PartialEq, Serialize, Deserialize)]
-#[repr(C)]
-pub struct CodingHeader {
-    pub encoded: bool,
-    pub start_index: u64,
-    pub set_index: Option<u64>,
-    pub data_count: usize,
-    pub parity_count: usize,
-    pub shard_size: usize,
 }
 
 #[derive(Clone)]
@@ -360,7 +352,7 @@ fn deserialize_single_packet_in_blob(data: &[u8], serialized_meta_size: usize) -
 }
 
 macro_rules! range {
-    ($prev:expr, $type:ident) => {
+    ($prev:expr, $type:ty) => {
         $prev..$prev + size_of::<$type>()
     };
 }
@@ -368,7 +360,7 @@ macro_rules! range {
 const PARENT_RANGE: std::ops::Range<usize> = range!(0, u64);
 const SLOT_RANGE: std::ops::Range<usize> = range!(PARENT_RANGE.end, u64);
 const INDEX_RANGE: std::ops::Range<usize> = range!(SLOT_RANGE.end, u64);
-const CODING_RANGE: std::ops::Range<usize> = range!(INDEX_RANGE.end, CodingHeader);
+const CODING_RANGE: std::ops::Range<usize> = range!(INDEX_RANGE.end, Option<CodingHeader>);
 const ID_RANGE: std::ops::Range<usize> = range!(CODING_RANGE.end, Pubkey);
 const FORWARDED_RANGE: std::ops::Range<usize> = range!(ID_RANGE.end, bool);
 const GENESIS_RANGE: std::ops::Range<usize> = range!(FORWARDED_RANGE.end, Hash);
@@ -426,10 +418,10 @@ impl Blob {
     }
 
     pub fn set_coding_header(&mut self, header: &CodingHeader) {
-        bincode::serialize_into(&mut self.data[CODING_RANGE], header).unwrap();
+        bincode::serialize_into(&mut self.data[CODING_RANGE], &Some(*header)).unwrap();
     }
 
-    pub fn get_coding_header(&self) -> CodingHeader {
+    pub fn get_coding_header(&self) -> Option<CodingHeader> {
         bincode::deserialize(&self.data[CODING_RANGE]).unwrap()
     }
 
@@ -497,10 +489,10 @@ impl Blob {
     }
 
     pub fn data(&self) -> &[u8] {
-        &self.data[BLOB_HEADER_SIZE..]
+        &self.data[BLOB_HEADER_SIZE..BLOB_HEADER_SIZE + BLOB_DATA_SIZE]
     }
     pub fn data_mut(&mut self) -> &mut [u8] {
-        &mut self.data[BLOB_HEADER_SIZE..]
+        &mut self.data[BLOB_HEADER_SIZE..BLOB_HEADER_SIZE + BLOB_DATA_SIZE]
     }
     pub fn size(&self) -> usize {
         let size = self.data_size() as usize;
