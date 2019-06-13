@@ -1,9 +1,6 @@
 use crate::erasure::CodingHeader;
 use solana_metrics::datapoint;
-use std::{
-    collections::HashMap,
-    ops::{Range, RangeInclusive},
-};
+use std::{collections::BTreeMap, ops::RangeBounds};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 // The Meta column family
@@ -35,7 +32,7 @@ pub struct SlotMeta {
 pub struct CodingIndex {
     slot: u64,
     /// Map from set index, to hashmap from blob index to presence bool
-    index: HashMap<u64, HashMap<u64, bool>>,
+    index: BTreeMap<u64, BTreeMap<u64, bool>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -51,7 +48,7 @@ pub struct Index {
 pub struct DataIndex {
     slot: u64,
     /// Map representing presence/absence of data blobs
-    index: HashMap<u64, bool>,
+    index: BTreeMap<u64, bool>,
 }
 
 impl Index {
@@ -98,25 +95,18 @@ impl CodingIndex {
     }
 
     pub fn set_present(&mut self, set_index: u64, blob_index: u64, present: bool) {
-        let set_map = self.index.entry(set_index).or_insert_with(HashMap::default);
+        let set_map = self
+            .index
+            .entry(set_index)
+            .or_insert_with(BTreeMap::default);
 
         set_map.insert(blob_index, present);
     }
 }
 
 impl DataIndex {
-    pub fn present_within(&self, range: RangeInclusive<u64>) -> usize {
-        self.index
-            .iter()
-            .filter(|(k, present)| range.start() <= k && *k <= range.end() && **present)
-            .count()
-    }
-
-    pub fn present_between(&self, range: Range<u64>) -> usize {
-        self.index
-            .iter()
-            .filter(|(&k, present)| range.start <= k && k < range.end && **present)
-            .count()
+    pub fn present_in_bounds(&self, bounds: impl RangeBounds<u64>) -> usize {
+        self.index.range(bounds).count()
     }
 
     pub fn is_present(&self, index: u64) -> bool {
@@ -210,7 +200,7 @@ impl ErasureMeta {
         let end_idx = start_idx + self.header.data_count as u64;
 
         let num_coding = index.coding().present_in_set(self.header.set_index);
-        let num_data = index.data().present_between(start_idx..end_idx);
+        let num_data = index.data().present_in_bounds(start_idx..end_idx);
 
         assert!(self.header.shard_size != 0);
 

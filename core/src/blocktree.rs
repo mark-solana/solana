@@ -1420,7 +1420,7 @@ fn try_erasure_recover(
                         ERASURE_SET_SIZE,
                         recovered
                             + index.coding().present_in_set(set_index)
-                            + index.data().present_between(start_index..data_end_index),
+                            + index.data().present_in_bounds(start_index..data_end_index),
                         "Recovery should always complete a set"
                     );
 
