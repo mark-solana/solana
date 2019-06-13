@@ -1,6 +1,9 @@
 use crate::erasure::CodingHeader;
 use solana_metrics::datapoint;
-use std::{collections::HashMap, ops::RangeBounds};
+use std::{
+    collections::HashMap,
+    ops::{Range, RangeInclusive},
+};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 // The Meta column family
@@ -102,10 +105,17 @@ impl CodingIndex {
 }
 
 impl DataIndex {
-    pub fn present_in_range(&self, bounds: impl RangeBounds<u64>) -> usize {
+    pub fn present_within(&self, range: RangeInclusive<u64>) -> usize {
         self.index
             .iter()
-            .filter(|(k, present)| bounds.contains(k) && **present)
+            .filter(|(k, present)| range.start() <= k && *k <= range.end() && **present)
+            .count()
+    }
+
+    pub fn present_between(&self, range: Range<u64>) -> usize {
+        self.index
+            .iter()
+            .filter(|(&k, present)| range.start <= k && k < range.end && **present)
             .count()
     }
 
@@ -200,7 +210,7 @@ impl ErasureMeta {
         let end_idx = start_idx + self.header.data_count as u64;
 
         let num_coding = index.coding().present_in_set(self.header.set_index);
-        let num_data = index.data().present_in_range(start_idx..=end_idx);
+        let num_data = index.data().present_within(start_idx..=end_idx);
 
         assert!(self.header.shard_size != 0);
 
