@@ -169,8 +169,8 @@ impl Column<Kvs> for cf::SlotMeta {
     }
 }
 
-impl Column<Kvs> for cf::SlotMeta {
-    const NAME: &'static str = super::META_CF;
+impl Column<Kvs> for cf::Index {
+    const NAME: &'static str = super::INDEX_CF;
     type Index = u64;
 
     fn key(slot: u64) -> Key {
@@ -184,8 +184,8 @@ impl Column<Kvs> for cf::SlotMeta {
     }
 }
 
-impl TypedColumn<Kvs> for cf::SlotMeta {
-    type Type = super::SlotMeta;
+impl TypedColumn<Kvs> for cf::Index {
+    type Type = crate::blocktree::meta::Index;
 }
 
 impl Column<Kvs> for cf::ErasureMeta {

@@ -99,7 +99,7 @@ pub fn encode<B: BorrowMut<Blob>>(
         data_count: data,
         parity_count: parity,
         start_index,
-        set_index: set_index,
+        set_index,
         shard_size: 0,
     };
 

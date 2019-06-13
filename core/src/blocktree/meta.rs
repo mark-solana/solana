@@ -1,6 +1,6 @@
 use crate::erasure::CodingHeader;
 use solana_metrics::datapoint;
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::RangeBounds};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 // The Meta column family
@@ -95,20 +95,17 @@ impl CodingIndex {
     }
 
     pub fn set_present(&mut self, set_index: u64, blob_index: u64, present: bool) {
-        let set_map = self
-            .index
-            .entry(set_index)
-            .or_insert_with(|| HashMap::default());
+        let set_map = self.index.entry(set_index).or_insert_with(HashMap::default);
 
         set_map.insert(blob_index, present);
     }
 }
 
 impl DataIndex {
-    pub fn present_within(&self, min_index: u64, max_index: u64) -> usize {
+    pub fn present_in_range(&self, bounds: impl RangeBounds<u64>) -> usize {
         self.index
             .iter()
-            .filter(|(&k, &present)| min_index <= k && k <= max_index && present)
+            .filter(|(k, present)| bounds.contains(k) && **present)
             .count()
     }
 
@@ -199,14 +196,11 @@ impl ErasureMeta {
     }
 
     pub fn status(&self, index: &Index) -> ErasureMetaStatus {
-        let num_data = (self.header.start_index
-            ..self.header.start_index + self.header.data_count as u64)
-            .filter(|idx| index.data().is_present(*idx))
-            .count();
+        let start_idx = self.header.start_index;
+        let end_idx = start_idx + self.header.data_count as u64;
 
-        let num_coding = (0..self.header.parity_count)
-            .filter(|idx| index.coding().is_present(self.set_index, *idx as u64))
-            .count();
+        let num_coding = index.coding().present_in_set(self.header.set_index);
+        let num_data = index.data().present_in_range(start_idx..=end_idx);
 
         assert!(self.header.shard_size != 0);
 
@@ -269,7 +263,7 @@ mod test {
             index.data_mut().set_present(i, false);
         }
 
-        assert_eq!(e_meta.status(&index), ErasureMetaStatus::StillNeed(8));
+        assert_eq!(e_meta.status(&index), ErasureMetaStatus::StillNeed(7));
 
         for i in 0..N_CODING {
             index.coding_mut().set_present(set_index, i, true);

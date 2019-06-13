@@ -328,7 +328,6 @@ impl Blocktree {
         )?;
 
         for (&(slot, set_index), erasure_meta) in erasure_meta_working_set.iter_mut() {
-            dbg!((slot, set_index));
             let index = index_working_set.get_mut(&slot).expect("Index");
             if let Some((data, coding)) = try_erasure_recover(
                 &db,
@@ -374,23 +373,11 @@ impl Blocktree {
         // Handle chaining for the working set
         handle_chaining(db, &mut write_batch, &slot_meta_working_set)?;
 
-        let mut should_signal = false;
-        let mut newly_completed_slots = vec![];
-
-        // Check if any metadata was changed, if so, insert the new version of the
-        // metadata into the write batch
-        for (slot, (meta, meta_backup)) in slot_meta_working_set.iter() {
-            let meta: &SlotMeta = &RefCell::borrow(&*meta);
-            if self.completed_slots_senders.is_empty() && is_newly_completed_slot(meta, meta_backup)
-            {
-                newly_completed_slots.push(*slot);
-            }
-            // Check if the working copy of the metadata has changed
-            if Some(meta) != meta_backup.as_ref() {
-                should_signal = should_signal || slot_has_updates(meta, &meta_backup);
-                write_batch.put::<cf::SlotMeta>(*slot, &meta)?;
-            }
-        }
+        let (should_signal, newly_completed_slots) = prepare_signals(
+            &slot_meta_working_set,
+            &self.completed_slots_senders,
+            &mut write_batch,
+        )?;
 
         for (&slot, index) in index_working_set.iter() {
             write_batch.put::<cf::Index>(slot, index)?;
@@ -629,23 +616,11 @@ impl Blocktree {
         // Handle chaining for the working set
         handle_chaining(&self.db, &mut writebatch, &slot_meta_working_set)?;
 
-        let mut should_signal = false;
-        let mut newly_completed_slots = vec![];
-
-        // Check if any metadata was changed, if so, insert the new version of the
-        // metadata into the write batch
-        for (slot, (meta, meta_backup)) in slot_meta_working_set.iter() {
-            let meta: &SlotMeta = &RefCell::borrow(&*meta);
-            if self.completed_slots_senders.is_empty() && is_newly_completed_slot(meta, meta_backup)
-            {
-                newly_completed_slots.push(*slot);
-            }
-            // Check if the working copy of the metadata has changed
-            if Some(meta) != meta_backup.as_ref() {
-                should_signal = should_signal || slot_has_updates(meta, &meta_backup);
-                writebatch.put::<cf::SlotMeta>(*slot, &meta)?;
-            }
-        }
+        let (should_signal, newly_completed_slots) = prepare_signals(
+            &slot_meta_working_set,
+            &self.completed_slots_senders,
+            &mut writebatch,
+        )?;
 
         for ((slot, set_index), erasure_meta) in erasure_metas {
             writebatch.put::<cf::ErasureMeta>((slot, set_index), &erasure_meta)?;
@@ -985,7 +960,6 @@ where
             let index = index_working_set.get_mut(&blob.slot()).expect("index");
 
             index.data_mut().set_present(blob.index(), true);
-            dbg!(index);
         }
     }
 
@@ -1446,7 +1420,7 @@ fn try_erasure_recover(
                         ERASURE_SET_SIZE,
                         recovered
                             + index.coding().present_in_set(set_index)
-                            + index.data().present_within(start_index, data_end_index),
+                            + index.data().present_in_range(start_index..data_end_index),
                         "Recovery should always complete a set"
                     );
 
@@ -1534,19 +1508,17 @@ fn recover(
     let mut blobs = Vec::with_capacity(ERASURE_SET_SIZE);
 
     for i in 0..info.data_count as u64 {
-        if data_index.is_present(start_idx + i) {
-            dbg!("is_present");
-            let blob_bytes = match prev_inserted_blob_datas.get(&(slot, i)) {
+        let idx = i + start_idx;
+        if data_index.is_present(idx) {
+            let blob_bytes = match prev_inserted_blob_datas.get(&(slot, idx)) {
                 Some(bytes) => bytes.to_vec(),
                 None => data_cf
-                    .get_bytes((slot, i))?
+                    .get_bytes((slot, idx))?
                     .expect("erasure_meta must have no false positives"),
             };
 
             blobs.push(Blob::new(&blob_bytes));
         } else {
-            dbg!("not_present");
-            //let set_relative_idx = erasure_meta.data_index_in_set(i + start_idx) as usize;
             present[i as usize] = false;
             blobs.push(Blob::default());
         }
@@ -1587,7 +1559,6 @@ fn recover(
         data_end_idx
     );
 
-    dbg!("recovered");
     Ok((recovered_data, recovered_coding))
 }
 
@@ -1629,6 +1600,31 @@ fn send_signals(
     }
 
     Ok(())
+}
+
+fn prepare_signals(
+    slot_meta_working_set: &HashMap<u64, (Rc<RefCell<SlotMeta>>, Option<SlotMeta>)>,
+    completed_slots_senders: &[SyncSender<Vec<u64>>],
+    write_batch: &mut WriteBatch,
+) -> Result<(bool, Vec<u64>)> {
+    let mut should_signal = false;
+    let mut newly_completed_slots = vec![];
+
+    // Check if any metadata was changed, if so, insert the new version of the
+    // metadata into the write batch
+    for (slot, (meta, meta_backup)) in slot_meta_working_set.iter() {
+        let meta: &SlotMeta = &RefCell::borrow(&*meta);
+        if !completed_slots_senders.is_empty() && is_newly_completed_slot(meta, meta_backup) {
+            newly_completed_slots.push(*slot);
+        }
+        // Check if the working copy of the metadata has changed
+        if Some(meta) != meta_backup.as_ref() {
+            should_signal = should_signal || slot_has_updates(meta, &meta_backup);
+            write_batch.put::<cf::SlotMeta>(*slot, &meta)?;
+        }
+    }
+
+    Ok((should_signal, newly_completed_slots))
 }
 
 fn deserialize_blobs<I>(blob_datas: &[I]) -> Vec<Entry>
@@ -2432,7 +2428,7 @@ pub mod tests {
     }
 
     #[test]
-    pub fn test_completed_blobs_signal() {
+    pub fn test_completed_blobs_signal_basic() {
         // Initialize ledger
         let ledger_path = get_tmp_ledger_path("test_completed_blobs_signal");
         let (ledger, _, recvr) = Blocktree::open_with_signal(&ledger_path).unwrap();
@@ -3395,7 +3391,7 @@ pub mod tests {
                 let coding_blobs = encode_shared(
                     slot,
                     set_index as u64,
-                    dbg!(start_index),
+                    start_index,
                     &data_blobs[..],
                     NUM_CODING,
                 )
@@ -3420,7 +3416,7 @@ pub mod tests {
                 }
 
                 // verify erasure meta
-                let index = dbg!(blocktree.index_cf.get(slot).unwrap().expect("index"));
+                let index = blocktree.index_cf.get(slot).unwrap().expect("index");
                 let erasure_meta = blocktree
                     .erasure_meta_cf
                     .get((slot, set_index as u64))
