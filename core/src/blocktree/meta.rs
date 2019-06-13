@@ -210,7 +210,7 @@ impl ErasureMeta {
         let end_idx = start_idx + self.header.data_count as u64;
 
         let num_coding = index.coding().present_in_set(self.header.set_index);
-        let num_data = index.data().present_within(start_idx..=end_idx);
+        let num_data = index.data().present_between(start_idx..end_idx);
 
         assert!(self.header.shard_size != 0);
 
