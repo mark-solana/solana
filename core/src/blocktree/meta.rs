@@ -82,7 +82,7 @@ impl CodingIndex {
 
     pub fn present_in_set(&self, set_index: u64) -> usize {
         match self.index.get(&set_index) {
-            Some(map) => map.keys().count(),
+            Some(map) => map.values().filter(|presence| **presence).count(),
             None => 0,
         }
     }
@@ -106,7 +106,10 @@ impl CodingIndex {
 
 impl DataIndex {
     pub fn present_in_bounds(&self, bounds: impl RangeBounds<u64>) -> usize {
-        self.index.range(bounds).count()
+        self.index
+            .range(bounds)
+            .filter(|(_, presence)| **presence)
+            .count()
     }
 
     pub fn is_present(&self, index: u64) -> bool {
@@ -196,6 +199,8 @@ impl ErasureMeta {
     }
 
     pub fn status(&self, index: &Index) -> ErasureMetaStatus {
+        use ErasureMetaStatus::*;
+
         let start_idx = self.header.start_index;
         let end_idx = start_idx + self.header.data_count as u64;
 
@@ -209,12 +214,14 @@ impl ErasureMeta {
             self.header.parity_count - num_coding,
         );
 
-        if data_missing > 0 && data_missing + coding_missing <= self.header.parity_count {
-            ErasureMetaStatus::CanRecover
+        let total_missing = data_missing + coding_missing;
+
+        if data_missing > 0 && total_missing <= self.header.parity_count {
+            CanRecover
         } else if data_missing == 0 {
-            ErasureMetaStatus::DataFull
+            DataFull
         } else {
-            ErasureMetaStatus::StillNeed(data_missing + coding_missing - self.header.parity_count)
+            StillNeed(total_missing - self.header.parity_count)
         }
     }
 }
@@ -223,24 +230,20 @@ impl ErasureMeta {
 mod test {
     use super::*;
 
-    const NUM_DATA: usize = 8;
-    const NUM_CODING: usize = 8;
+    const NUM_DATA: u64 = 7;
+    const NUM_CODING: u64 = 8;
 
     fn sample_header() -> CodingHeader {
         CodingHeader {
             shard_size: 1,
-            data_count: NUM_DATA,
-            parity_count: NUM_CODING,
+            data_count: NUM_DATA as usize,
+            parity_count: NUM_CODING as usize,
             ..CodingHeader::default()
         }
     }
 
     #[test]
     fn test_erasure_meta_status() {
-        // Local constansts just used to avoid repetitive casts
-        const N_DATA: u64 = NUM_DATA as u64;
-        const N_CODING: u64 = NUM_CODING as u64;
-
         let set_index = 0;
 
         let header = sample_header();
@@ -249,26 +252,34 @@ mod test {
 
         let mut index = Index::new(0);
 
-        for i in 0..N_DATA - 1 {
+        assert_eq!(e_meta.status(&index), ErasureMetaStatus::StillNeed(7));
+
+        for i in 0..NUM_DATA {
             index.data_mut().set_present(i, true);
         }
 
-        assert_eq!(e_meta.status(&index), ErasureMetaStatus::StillNeed(1));
-
-        index.data_mut().set_present(N_DATA, true);
-
         assert_eq!(e_meta.status(&index), ErasureMetaStatus::DataFull);
 
-        for i in 0..N_DATA - 1 {
+        index.data_mut().set_present(NUM_DATA - 1, false);
+
+        assert_eq!(e_meta.status(&index), ErasureMetaStatus::StillNeed(1));
+
+        for i in 0..NUM_DATA - 2 {
             index.data_mut().set_present(i, false);
         }
 
-        assert_eq!(e_meta.status(&index), ErasureMetaStatus::StillNeed(7));
+        assert_eq!(e_meta.status(&index), ErasureMetaStatus::StillNeed(6));
 
-        for i in 0..N_CODING {
+        for i in 0..NUM_CODING {
             index.coding_mut().set_present(set_index, i, true);
         }
 
-        assert_eq!(e_meta.status(&index), ErasureMetaStatus::CanRecover);
+        index.data_mut().set_present(NUM_DATA - 1, false);
+
+        for i in 0..NUM_DATA - 1 {
+            index.data_mut().set_present(i, true);
+
+            assert_eq!(e_meta.status(&index), ErasureMetaStatus::CanRecover);
+        }
     }
 }
