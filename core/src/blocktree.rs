@@ -671,6 +671,23 @@ impl Blocktree {
         Ok(())
     }
 
+    pub fn put_shared_coding_blobs<I>(&self, blobs: I) -> Result<()>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<SharedBlob>,
+    {
+        let shared_blobs: Vec<_> = blobs.into_iter().map(move |s| s.borrow().clone()).collect();
+
+        let locks: Vec<_> = shared_blobs
+            .iter()
+            .map(move |b| b.read().unwrap())
+            .collect();
+
+        let blob_refs = locks.iter().map(|s| &**s);
+
+        self.put_many_coding_blobs(blob_refs)
+    }
+
     pub fn get_data_blob(&self, slot: u64, blob_index: u64) -> Result<Option<Blob>> {
         let bytes = self.get_data_blob_bytes(slot, blob_index)?;
         Ok(bytes.map(|bytes| {

@@ -159,8 +159,26 @@ pub(super) fn generate_coding_blobs(
 ) -> Vec<SharedBlob> {
     let set_len = blobs.len();
 
-    let coding = erasure::encode_shared(slot, set_index, start_index, blobs, set_len)
-        .expect("Erasure coding failed");
+    trace!(
+        "generating coding blobs: [slot = {}, set_index = {}, start_index = {}]",
+        slot,
+        set_index,
+        start_index,
+    );
+
+    let coding = match erasure::encode_shared(slot, set_index, start_index, blobs, set_len) {
+        Ok(blobs) => blobs,
+        Err(e) => {
+            error!(
+                "Failed to generate coding blobs [slot = {}, set_index = {}, start_index = {}]: {}",
+                slot, set_index, start_index, e
+            );
+            panic!(
+                "Failed to generate coding blobs [slot = {}, set_index = {}, start_index = {}]: {}",
+                slot, set_index, start_index, e
+            );
+        }
+    };
 
     thread_pool.install(|| {
         coding.par_iter().for_each(|c| {
